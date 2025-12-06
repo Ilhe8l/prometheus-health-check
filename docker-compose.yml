@@ -1,0 +1,20 @@
+services:
+  health-check:
+    build: ./health_check
+    container_name: health-check
+    restart: always
+    volumes:
+      - ./config.yml:/app/config.yml
+      - /var/run/docker.sock:/var/run/docker.sock # necessário para monitorar outros containers
+    ports:
+      - "8000:8000"
+      - "9090:9090"
+    env_file:
+      - .env
+    networks:
+      - agentes-network
+
+
+networks:
+  agentes-network:
+    external: true

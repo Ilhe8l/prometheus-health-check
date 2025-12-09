@@ -1,13 +1,20 @@
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
-DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://user:password@postgres:5432/mydatabase')
-REDIS_URL= os.getenv('REDIS_URL', 'redis://redis:6379/0')
-MINIO_URL = os.getenv('MINIO_URL', 'http://minio:9001')
-MINIO_ACESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
-MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
-CONTAINERS_TO_MONITOR = os.getenv('CONTAINERS_TO_MONITOR', "minio,postgres,redis,whatsapp_service,agents").split(",")
-WHATSAPP_SERVICE_URL = os.getenv('WHATSAPP_SERVICE_URL', 'http://whatsapp_service:8000/direct-message')
-K8S_DEPLOYMENTS_TO_MONITOR = os.getenv('K8S_DEPLOYMENTS_TO_MONITOR', "my-deployment-1,my-deployment-2").split(",")  # Lista de Deployments no K8s para monitorar
-K8S_NAMESPACE = os.getenv('K8S_NAMESPACE', 'default')  
+DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_URL = os.getenv("REDIS_URL")
+MINIO_URL = os.getenv("MINIO_URL") # Lembrar do https://
+MINIO_ACESS_KEY = os.getenv("MINIO_ACESS_KEY")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY")
+
+# URL Pública para testar o fluxo (O curl)
+WHATSAPP_LOGIC_URL = os.getenv("WHATSAPP_LOGIC_URL", "https://edite.aws.leds.dev.br/direct-message")
+
+# Nomes dos services internos no Kubernetes para teste de TCP (Se estão de pé)
+K8S_CONTROLPANEL_HOST = os.getenv("K8S_CONTROLPANEL_HOST", "controlpanel")
+K8S_CONTROLPANEL_PORT = os.getenv("K8S_CONTROLPANEL_PORT", "8000")
+
+K8S_WHATSAPP_HOST = os.getenv("K8S_WHATSAPP_HOST", "whatsapp-service")
+K8S_WHATSAPP_PORT = os.getenv("K8S_WHATSAPP_PORT", "3000")

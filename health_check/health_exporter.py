@@ -2,6 +2,8 @@ import asyncio
 import time
 import socket
 import logging
+import json
+
 import psycopg2
 import redis
 import requests
@@ -14,22 +16,25 @@ from config import (
     DATABASE_URL,
     REDIS_URL,
     MINIO_URL,
-    MINIO_ACESS_KEY,
+    MINIO_ACCESS_KEY,
     MINIO_SECRET_KEY,
-    WHATSAPP_LOGIC_URL, # A URL: https://edite.aws.leds.dev.br/direct-message
-    K8S_CONTROLPANEL_HOST, # Nome do service: controlpanel
-    K8S_CONTROLPANEL_PORT, # Porta: 8000
-    K8S_WHATSAPP_HOST,     # Nome do service: whatsapp-service
-    K8S_WHATSAPP_PORT      # Porta: 3000
+    WHATSAPP_LOGIC_URL,
+    K8S_CONTROLPANEL_HOST,
+    K8S_CONTROLPANEL_PORT,
+    K8S_WHATSAPP_HOST,
+    K8S_WHATSAPP_PORT
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
+# Métricas Prometheus
 HEALTH_STATUS = Gauge("app_health_status", "Status do servico (1=UP, 0=DOWN)", ["service"])
 HEALTH_LATENCY = Gauge("app_health_latency_seconds", "Tempo de resposta da checagem", ["service"])
+
 CHECK_SEMAPHORE = asyncio.Semaphore(20)
 SERVICES_STATE = {}
 
+# monitoramento de um serviço genérico
 async def monitor_service(service_name, check_func):
     async with CHECK_SEMAPHORE:
         start_time = time.time()
@@ -47,6 +52,7 @@ async def monitor_service(service_name, check_func):
             logging.error(f"[x] [{service_name}] FALHA: {e}")
             return {"service": service_name, "is_healthy": False, "latency": elapsed, "error_message": str(e)}
 
+# testes de infraestrutura básica
 async def check_postgresql():
     def _check():
         conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
@@ -66,7 +72,7 @@ async def check_s3():
         s3 = boto3_client(
             "s3",
             endpoint_url=MINIO_URL,
-            aws_access_key_id=MINIO_ACESS_KEY,
+            aws_access_key_id=MINIO_ACCESS_KEY,
             aws_secret_access_key=MINIO_SECRET_KEY,
         )
         s3.list_buckets()
@@ -80,11 +86,25 @@ async def check_openai_conn():
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check)
 
-# Checagem TCP (Socket) para ver se o Pod/Service Kubernetes está aceitando conexão
+
+async def check_openai_generation():
+    def _check():
+        client = OpenAI()
+        client.chat.completions.create(
+            model="gpt-4.1", # modelo usado em producao
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=5,
+        )
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _check)
+
+
+# testes de infraestrutura interna K8s (porta TCP)
 async def check_tcp_service(host, port):
     def _check():
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3)
+        # tenta conectar no Service do K8s (ex: controlpanel:8000)
         result = sock.connect_ex((host, int(port)))
         sock.close()
         if result != 0:
@@ -92,7 +112,7 @@ async def check_tcp_service(host, port):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check)
 
-# Checagem Lógica do WhatsApp (O CURL que você mandou)
+# testes de lógica de negócio (curl externo)
 async def check_whatsapp_logic():
     def _check():
         payload = {
@@ -100,9 +120,9 @@ async def check_whatsapp_logic():
             "from_number": "11988887777",
             "to_number": "11999999999",
             "contact_name": "Usuario Teste",
-            "session_id": "health-check-monitor" 
+            "session_id": "health-check-monitor"
         }
-        # Bate na URL publica/ingress
+        # bate na URL pública HTTPS
         response = requests.post(
             WHATSAPP_LOGIC_URL,
             json=payload,
@@ -113,23 +133,27 @@ async def check_whatsapp_logic():
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check)
 
+
+# lógica principal de verificação
 async def run_all_checks():
     logging.info("[i] Iniciando ciclo de verificação")
     tasks = []
     
-    # 1. Infra Externa
+    # infra Básica
     tasks.append(monitor_service("postgresql", check_postgresql))
     tasks.append(monitor_service("redis", check_redis))
     tasks.append(monitor_service("minio_s3", check_s3))
-    tasks.append(monitor_service("openai_api", check_openai_conn))
+    tasks.append(monitor_service("openai_api_list", check_openai_conn))
     
-    # 2. Infra Interna Kubernetes (Teste de Porta TCP)
-    # Verifica se o container está rodando e escutando
-    tasks.append(monitor_service(f"k8s_svc_controlpanel", lambda: check_tcp_service(K8S_CONTROLPANEL_HOST, K8S_CONTROLPANEL_PORT)))
-    tasks.append(monitor_service(f"k8s_svc_whatsapp", lambda: check_tcp_service(K8S_WHATSAPP_HOST, K8S_WHATSAPP_PORT)))
+    # infra Interna K8s (Porta TCP)
+    tasks.append(monitor_service("k8s_svc_controlpanel", lambda: check_tcp_service(K8S_CONTROLPANEL_HOST, K8S_CONTROLPANEL_PORT)))
+    tasks.append(monitor_service("k8s_svc_whatsapp", lambda: check_tcp_service(K8S_WHATSAPP_HOST, K8S_WHATSAPP_PORT)))
 
-    # 3. Teste de Lógica (Curl do WhatsApp)
+    # lógica de Negócio (Curl Externo)
     tasks.append(monitor_service("app_logic_whatsapp", check_whatsapp_logic))
+    
+    # teste Caro (Generation)
+    tasks.append(monitor_service("openai_gen_gpt4.1", check_openai_generation))
     
     results = await asyncio.gather(*tasks)
     
@@ -140,6 +164,8 @@ async def run_all_checks():
     logging.info(f"[*/x] Ciclo concluido. Status: {'OK' if all_healthy else 'FALHA'}")
     return all_healthy
 
+
+# endpoint HTTP para health check
 async def health_endpoint(request):
     if not SERVICES_STATE:
         return web.json_response({"status": "unknown"}, status=503)
@@ -166,7 +192,7 @@ async def monitoring_loop():
         await asyncio.sleep(30)
 
 async def main():
-    start_http_server(9090)
+    start_http_server(9090) # Prometheus
     await start_health_server()
     await monitoring_loop()
 

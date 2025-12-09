@@ -2,10 +2,10 @@ import asyncio
 import time
 import os
 import logging
+from kubernetes import client, config
 
 import psycopg2
 import redis
-import docker
 import requests
 from boto3 import client as boto3_client
 from openai import OpenAI
@@ -18,11 +18,21 @@ from config import (
     MINIO_URL,
     MINIO_ACESS_KEY,
     MINIO_SECRET_KEY,
-    CONTAINERS_TO_MONITOR,
     WHATSAPP_SERVICE_URL,
+    K8S_DEPLOYMENTS_TO_MONITOR, 
+    K8S_NAMESPACE,              
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+
+# Carrega configuração do Kubernetes (In-cluster ou Local)
+try:
+    config.load_incluster_config()
+except config.ConfigException:
+    try:
+        config.load_kube_config()
+    except:
+        logging.warning("Não foi possível carregar configuração do Kubernetes")
 
 # definição das métricas prometheus
 HEALTH_STATUS = Gauge("app_health_status", "Status do servico (1=UP, 0=DOWN)", ["service"])
@@ -121,7 +131,7 @@ async def check_openai_generation():
     def _check():
         client = OpenAI()
         client.chat.completions.create(
-            model="gpt-4.1",  # modelo usado em produção, troque para um mais barato se quiser economizar
+            model="gpt-4",
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=5,
         )
@@ -152,23 +162,29 @@ async def check_whatsapp_flow():
     await loop.run_in_executor(None, _check)
 
 
-# checagem de container docker individual
-async def check_container(container_name):
+# checagem de deployment kubernetes
+async def check_k8s_deployment(deployment_name):
     def _check():
-        client = docker.from_env()
-        container = client.containers.get(container_name)
+        v1 = client.AppsV1Api()
+        try:
+            deploy = v1.read_namespaced_deployment(deployment_name, K8S_NAMESPACE)
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                raise Exception(f"Deployment não encontrado: {deployment_name}")
+            raise e
+
+        desired = deploy.spec.replicas
+        ready = deploy.status.ready_replicas
         
-        # verifica se está "running"
-        if container.status != "running":
-            raise Exception(f"[x] Status is {container.status}")
+        if ready is None:
+            ready = 0
+            
+        if ready == 0 and desired > 0:
+             raise Exception(f"Nenhum pod pronto. Desejado: {desired}, Pronto: {ready}")
         
-        # se tiver healthcheck nativo do docker, verifica ele também
-        health = container.attrs.get("State", {}).get("Health", {}).get("Status")
-        if health and health != "healthy":
-            raise Exception(f"[x] Docker Health is {health}")
-    
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check)
+
 
 # executa todas as checagens em paralelo e atualiza o estado global
 async def run_all_checks():
@@ -182,13 +198,13 @@ async def run_all_checks():
     tasks.append(monitor_service("minio_s3", check_s3))
     tasks.append(monitor_service("openai_api_conn", check_openai_conn))
     
-    # checagem de containers
-    for container_name in CONTAINERS_TO_MONITOR:
-        if container_name.strip():
+    # checagem de deployments kubernetes
+    for deploy_name in K8S_DEPLOYMENTS_TO_MONITOR:
+        if deploy_name.strip():
             tasks.append(
                 monitor_service(
-                    f"container_{container_name}",
-                    lambda name=container_name: check_container(name),
+                    f"k8s_deploy_{deploy_name}",
+                    lambda name=deploy_name: check_k8s_deployment(name),
                 )
             )
     
@@ -209,6 +225,7 @@ async def run_all_checks():
     logging.info(f"[*/x] Ciclo concluido. Status: {'OK' if all_healthy else 'FALHA'}")
     
     return all_healthy
+
 
 # endpoint /health retorna 200 se tudo ok, 503 se algum serviço está down
 async def health_endpoint(request):
@@ -263,6 +280,7 @@ async def health_endpoint(request):
             status=503,
         )
 
+
 # inicia servidor /health
 async def start_health_server():
     app = web.Application()
@@ -273,6 +291,7 @@ async def start_health_server():
     site = web.TCPSite(runner, "0.0.0.0", 8000)
     await site.start()
     logging.info("[i] Servidor /health rodando na porta 8000")
+
 
 # checagem periódica em loop
 async def monitoring_loop():

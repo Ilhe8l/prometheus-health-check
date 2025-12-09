@@ -9,3 +9,5 @@ MINIO_ACESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
 MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
 CONTAINERS_TO_MONITOR = os.getenv('CONTAINERS_TO_MONITOR', "minio,postgres,redis,whatsapp_service,agents").split(",")
 WHATSAPP_SERVICE_URL = os.getenv('WHATSAPP_SERVICE_URL', 'http://whatsapp_service:8000/direct-message')
+K8S_DEPLOYMENTS_TO_MONITOR = os.getenv('K8S_DEPLOYMENTS_TO_MONITOR', "my-deployment-1,my-deployment-2").split(",")  # Lista de Deployments no K8s para monitorar
+K8S_NAMESPACE = os.getenv('K8S_NAMESPACE', 'default')  

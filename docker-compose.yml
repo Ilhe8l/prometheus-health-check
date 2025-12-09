@@ -3,8 +3,6 @@ services:
     build: ./health_check
     container_name: health-check
     restart: always
-    volumes:
-      - ./config.yml:/app/config.yml
     ports:
       - "8000:8000"
       - "9090:9090"

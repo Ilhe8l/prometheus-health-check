@@ -19,6 +19,7 @@ from config import (
     MINIO_ACESS_KEY,
     MINIO_SECRET_KEY,
     CONTAINERS_TO_MONITOR,
+    WHATSAPP_SERVICE_URL,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
@@ -131,7 +132,7 @@ async def check_openai_generation():
 
 async def check_whatsapp_flow():
     def _check():
-        url = "http://whatsapp_service:8000/direct-message"
+        url = WHATSAPP_SERVICE_URL
         payload = {
             "content": "ping",  # mensagem simples para healthcheck
             "from_number": "HEALTHCHECK",

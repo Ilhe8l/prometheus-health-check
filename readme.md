@@ -20,14 +20,19 @@ Esse serviço é responsável por monitorar a saúde de vários componentes do s
 
 ## Métricas de filas
 
-O monitor não chama APIs pagas no ciclo padrão. As filas são avaliadas somente por
-leituras no Redis Streams:
+O monitor não chama APIs pagas no ciclo padrão. As filas são avaliadas por
+métricas do Redis Streams:
+
+Antes de medir, o monitor garante de forma idempotente que cada par
+`stream:consumer_group` configurado em `STREAMS_GROUPS` exista no Redis usando
+`XGROUP CREATE ... MKSTREAM`. Isso permite manter grupos operacionais como
+`queue_responses_dlq:ops_group` em produção mesmo sem um worker dedicado de DLQ.
 
 - `app_queue_group_lag`: mensagens acumuladas que ainda não foram entregues ao consumer group.
 - `app_queue_group_pending`: mensagens entregues ao consumer e ainda sem ACK.
 - `app_queue_group_stale_pending`: mensagens pendentes acima de `QUEUE_STALE_THRESHOLD_MS`.
 - `app_queue_group_oldest_pending_seconds`: idade da pendente mais antiga inspecionada.
-- `app_queue_group_health_status`: `1` quando o par `stream/group` está dentro dos limites, `0` quando está com lag alto, pending alto, mensagem velha, stream ausente ou grupo ausente.
+- `app_queue_group_health_status`: `1` quando o par `stream/group` está dentro dos limites, `0` quando está com lag alto, pending alto, mensagem velha ou falha ao preparar o stream/group.
 - `app_queue_stream_length`: tamanho total do stream.
 
 Regras de saúde:

@@ -137,32 +137,61 @@ async def check_whatsapp_logic():
     await loop.run_in_executor(None, _check)
 
 async def check_redis_streams():
+    def _reset_queue_metrics(stream, group):
+        QUEUE_GROUP_LAG.labels(stream=stream, group=group).set(0)
+        QUEUE_GROUP_PENDING.labels(stream=stream, group=group).set(0)
+        QUEUE_GROUP_STALE_PENDING.labels(stream=stream, group=group).set(0)
+        QUEUE_GROUP_OLDEST_PENDING_SECONDS.labels(stream=stream, group=group).set(0)
+        QUEUE_GROUP_HEALTH_STATUS.labels(stream=stream, group=group).set(0)
+
+    def _create_stream_group(client, stream, group, message):
+        try:
+            client.xgroup_create(stream, group, id="0", mkstream=True)
+            logging.info(message)
+        except redis.exceptions.ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+    def _ensure_stream_group(client, stream, group):
+        try:
+            groups_info = client.xinfo_groups(stream)
+        except redis.exceptions.ResponseError:
+            _create_stream_group(
+                client,
+                stream,
+                group,
+                f"[+] [{stream}/{group}] stream/group criado para monitoramento",
+            )
+            return client.xinfo_groups(stream)
+
+        if any(g.get("name") == group for g in groups_info):
+            return groups_info
+
+        _create_stream_group(
+            client,
+            stream,
+            group,
+            f"[+] [{stream}/{group}] consumer group criado para monitoramento",
+        )
+        return client.xinfo_groups(stream)
+
     def _check():
         client = redis.Redis.from_url(REDIS_URL, socket_timeout=3, decode_responses=True)
         violations = []
 
         for stream, group in STREAMS_GROUPS:
-            stream_len = client.xlen(stream)
-            QUEUE_STREAM_LENGTH.labels(stream=stream).set(stream_len)
-
             try:
-                groups_info = client.xinfo_groups(stream)
+                groups_info = _ensure_stream_group(client, stream, group)
+                stream_len = client.xlen(stream)
+                QUEUE_STREAM_LENGTH.labels(stream=stream).set(stream_len)
             except redis.exceptions.ResponseError as exc:
-                QUEUE_GROUP_LAG.labels(stream=stream, group=group).set(0)
-                QUEUE_GROUP_PENDING.labels(stream=stream, group=group).set(0)
-                QUEUE_GROUP_STALE_PENDING.labels(stream=stream, group=group).set(0)
-                QUEUE_GROUP_OLDEST_PENDING_SECONDS.labels(stream=stream, group=group).set(0)
-                QUEUE_GROUP_HEALTH_STATUS.labels(stream=stream, group=group).set(0)
-                violations.append(f"{stream}/{group}: stream indisponivel ({exc})")
+                _reset_queue_metrics(stream, group)
+                violations.append(f"{stream}/{group}: nao foi possivel preparar stream/group ({exc})")
                 continue
 
             group_info = next((g for g in groups_info if g.get("name") == group), None)
             if group_info is None:
-                QUEUE_GROUP_LAG.labels(stream=stream, group=group).set(0)
-                QUEUE_GROUP_PENDING.labels(stream=stream, group=group).set(0)
-                QUEUE_GROUP_STALE_PENDING.labels(stream=stream, group=group).set(0)
-                QUEUE_GROUP_OLDEST_PENDING_SECONDS.labels(stream=stream, group=group).set(0)
-                QUEUE_GROUP_HEALTH_STATUS.labels(stream=stream, group=group).set(0)
+                _reset_queue_metrics(stream, group)
                 violations.append(f"{stream}/{group}: grupo nao encontrado")
                 continue
 

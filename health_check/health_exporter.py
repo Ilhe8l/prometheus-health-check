@@ -2,22 +2,21 @@ import asyncio
 import time
 import socket
 import logging
-import json
 
 import psycopg2
 import redis
 import requests
 from boto3 import client as boto3_client
-from openai import OpenAI
 from prometheus_client import start_http_server, Gauge
 from aiohttp import web
 
 from config import (
     DATABASE_URL,
     REDIS_URL,
-    MINIO_URL,
-    MINIO_ACCESS_KEY,
-    MINIO_SECRET_KEY,
+    S3_ENDPOINT_URL,
+    S3_ACCESS_KEY,
+    S3_SECRET_KEY,
+    S3_BUCKET_NAME,
     WHATSAPP_LOGIC_URL,
     K8S_CONTROLPANEL_HOST,
     K8S_CONTROLPANEL_PORT,
@@ -25,7 +24,12 @@ from config import (
     K8S_WHATSAPP_PORT,
     ENABLE_COSTLY_CHECKS,
     CHECK_INTERVAL_STANDARD,
-    CHECK_INTERVAL_COSTLY
+    CHECK_INTERVAL_COSTLY,
+    STREAMS_GROUPS,
+    QUEUE_STALE_THRESHOLD_MS,
+    QUEUE_LAG_THRESHOLD,
+    QUEUE_PENDING_THRESHOLD,
+    QUEUE_MAX_PENDING_INSPECT,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
@@ -33,6 +37,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 # métricas Prometheus
 HEALTH_STATUS = Gauge("app_health_status", "Status do servico (1=UP, 0=DOWN)", ["service"])
 HEALTH_LATENCY = Gauge("app_health_latency_seconds", "Tempo de resposta da checagem", ["service"])
+QUEUE_STREAM_LENGTH = Gauge("app_queue_stream_length", "Total de mensagens no Redis Stream", ["stream"])
+QUEUE_GROUP_LAG = Gauge("app_queue_group_lag", "Mensagens ainda nao entregues ao consumer group", ["stream", "group"])
+QUEUE_GROUP_PENDING = Gauge("app_queue_group_pending", "Mensagens entregues e ainda sem ACK", ["stream", "group"])
+QUEUE_GROUP_STALE_PENDING = Gauge("app_queue_group_stale_pending", "Mensagens pendentes acima do limite de idade", ["stream", "group"])
+QUEUE_GROUP_OLDEST_PENDING_SECONDS = Gauge("app_queue_group_oldest_pending_seconds", "Idade da mensagem pendente mais antiga inspecionada", ["stream", "group"])
+QUEUE_GROUP_HEALTH_STATUS = Gauge("app_queue_group_health_status", "Saude do consumer group (1=OK, 0=FALHA)", ["stream", "group"])
 
 CHECK_SEMAPHORE = asyncio.Semaphore(20)
 SERVICES_STATE = {}
@@ -75,20 +85,19 @@ async def check_redis():
 
 async def check_s3():
     def _check():
-        s3 = boto3_client(
-            "s3",
-            endpoint_url=MINIO_URL,
-            aws_access_key_id=MINIO_ACCESS_KEY,
-            aws_secret_access_key=MINIO_SECRET_KEY,
-        )
-        s3.list_buckets()
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _check)
+        kwargs = {}
+        if S3_ENDPOINT_URL:
+            kwargs["endpoint_url"] = S3_ENDPOINT_URL
+        if S3_ACCESS_KEY:
+            kwargs["aws_access_key_id"] = S3_ACCESS_KEY
+        if S3_SECRET_KEY:
+            kwargs["aws_secret_access_key"] = S3_SECRET_KEY
 
-async def check_openai_conn():
-    def _check():
-        client = OpenAI()
-        client.models.list()
+        s3 = boto3_client("s3", **kwargs)
+        if S3_BUCKET_NAME:
+            s3.head_bucket(Bucket=S3_BUCKET_NAME)
+        else:
+            s3.list_buckets()
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check)
 
@@ -104,9 +113,12 @@ async def check_tcp_service(host, port):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check)
 
-# testes de lógica de negócio (Checks Caros/Pesados)
+# teste sintetico opcional. Em prod, deixa desabilitado se nao quiser gerar mensagem/custo.
 async def check_whatsapp_logic():
     def _check():
+        if not WHATSAPP_LOGIC_URL:
+            raise Exception("WHATSAPP_LOGIC_URL nao configurado")
+
         payload = {
             "content": "quais editais disponiveis?",
             "from_number": "11988887777",
@@ -124,14 +136,85 @@ async def check_whatsapp_logic():
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check)
 
-async def check_openai_generation():
+async def check_redis_streams():
     def _check():
-        client = OpenAI()
-        client.chat.completions.create(
-            model="gpt-4.1-mini", 
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=5,
-        )
+        client = redis.Redis.from_url(REDIS_URL, socket_timeout=3, decode_responses=True)
+        violations = []
+
+        for stream, group in STREAMS_GROUPS:
+            stream_len = client.xlen(stream)
+            QUEUE_STREAM_LENGTH.labels(stream=stream).set(stream_len)
+
+            try:
+                groups_info = client.xinfo_groups(stream)
+            except redis.exceptions.ResponseError as exc:
+                QUEUE_GROUP_LAG.labels(stream=stream, group=group).set(0)
+                QUEUE_GROUP_PENDING.labels(stream=stream, group=group).set(0)
+                QUEUE_GROUP_STALE_PENDING.labels(stream=stream, group=group).set(0)
+                QUEUE_GROUP_OLDEST_PENDING_SECONDS.labels(stream=stream, group=group).set(0)
+                QUEUE_GROUP_HEALTH_STATUS.labels(stream=stream, group=group).set(0)
+                violations.append(f"{stream}/{group}: stream indisponivel ({exc})")
+                continue
+
+            group_info = next((g for g in groups_info if g.get("name") == group), None)
+            if group_info is None:
+                QUEUE_GROUP_LAG.labels(stream=stream, group=group).set(0)
+                QUEUE_GROUP_PENDING.labels(stream=stream, group=group).set(0)
+                QUEUE_GROUP_STALE_PENDING.labels(stream=stream, group=group).set(0)
+                QUEUE_GROUP_OLDEST_PENDING_SECONDS.labels(stream=stream, group=group).set(0)
+                QUEUE_GROUP_HEALTH_STATUS.labels(stream=stream, group=group).set(0)
+                violations.append(f"{stream}/{group}: grupo nao encontrado")
+                continue
+
+            lag = group_info.get("lag") or 0
+            pending = group_info.get("pending") or 0
+            stale_count = 0
+            oldest_pending_seconds = 0
+
+            if pending > 0:
+                pending_entries = client.xpending_range(
+                    stream,
+                    group,
+                    min="-",
+                    max="+",
+                    count=QUEUE_MAX_PENDING_INSPECT,
+                )
+                idle_times = [
+                    entry.get("time_since_delivered", 0)
+                    for entry in pending_entries
+                ]
+                if idle_times:
+                    oldest_pending_seconds = max(idle_times) / 1000
+                    stale_count = sum(
+                        1
+                        for idle_time in idle_times
+                        if idle_time > QUEUE_STALE_THRESHOLD_MS
+                    )
+
+            QUEUE_GROUP_LAG.labels(stream=stream, group=group).set(lag)
+            QUEUE_GROUP_PENDING.labels(stream=stream, group=group).set(pending)
+            QUEUE_GROUP_STALE_PENDING.labels(stream=stream, group=group).set(stale_count)
+            QUEUE_GROUP_OLDEST_PENDING_SECONDS.labels(stream=stream, group=group).set(oldest_pending_seconds)
+
+            group_violations = []
+            if lag > QUEUE_LAG_THRESHOLD:
+                group_violations.append(f"lag={lag}")
+            if pending > QUEUE_PENDING_THRESHOLD:
+                group_violations.append(f"pending={pending}")
+            if stale_count > 0:
+                group_violations.append(
+                    f"stale_pending={stale_count} oldest_pending={oldest_pending_seconds:.0f}s"
+                )
+
+            if group_violations:
+                QUEUE_GROUP_HEALTH_STATUS.labels(stream=stream, group=group).set(0)
+                violations.append(f"{stream}/{group}: {', '.join(group_violations)}")
+            else:
+                QUEUE_GROUP_HEALTH_STATUS.labels(stream=stream, group=group).set(1)
+
+        if violations:
+            raise Exception("; ".join(violations))
+
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check)
 
@@ -148,8 +231,8 @@ async def run_all_checks():
     # infra Básica (Sempre roda)
     tasks.append(monitor_service("postgresql", check_postgresql))
     tasks.append(monitor_service("redis", check_redis))
-    tasks.append(monitor_service("minio_s3", check_s3))
-    tasks.append(monitor_service("openai_api_list", check_openai_conn))
+    tasks.append(monitor_service("s3_storage", check_s3))
+    tasks.append(monitor_service("redis_streams", check_redis_streams))
     
     # infra Interna K8s (Sempre roda)
     tasks.append(monitor_service("k8s_svc_controlpanel", lambda: check_tcp_service(K8S_CONTROLPANEL_HOST, K8S_CONTROLPANEL_PORT)))
@@ -166,9 +249,8 @@ async def run_all_checks():
             logging.info(f"[i] Checks caros ignorados. Último: {int(time_since_last)}s atrás (Intervalo: {CHECK_INTERVAL_COSTLY}s)")
     
     if should_run_costly:
-        logging.info("[i] Executando checks caros (WhatsApp + OpenAI Gen)")
+        logging.info("[i] Executando check sintetico do WhatsApp")
         tasks.append(monitor_service("app_logic_whatsapp", check_whatsapp_logic))
-        tasks.append(monitor_service("openai_gen_gpt", check_openai_generation))
         # atualiza o timestamp apenas se enfileirou a task
         LAST_COSTLY_RUN_TIME = current_time
 
